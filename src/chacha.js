@@ -70,7 +70,7 @@
  * ---------------------------------------------------------------------------
  */
 
-import { equal } from './commons/ct.js';
+import { equal_at } from './commons/ct.js';
 import { keystream_create } from './commons/block_modes.js';
 import { rd_le32, wr_le32, wr_le32s, check_room, overlaps_elsewhere } from './commons/bytes.js';
 
@@ -285,12 +285,12 @@ function chacha_n(name, key, nonce, data, counter, rounds) {
         throw new Error(name + ': counter would exceed 2^32 - use a fresh nonce');
     }
 
-    return stream_into(key, nonce, data, ctr, rounds, new Uint8Array(data.length), 0);
+    return stream_into(key, nonce, data, data.length, ctr, rounds, new Uint8Array(data.length), 0);
 }
-/* data xor the keystream from block `ctr`, into out[at .. at + data.length) - checked by the caller */
-function stream_into(key, nonce, data, ctr, rounds, out, at) {
-    for (var i = 0, n; i < data.length; i += BLOCK) {
-        n = data.length - i; if (n > BLOCK) { n = BLOCK; }
+/* data[0 .. len) xor the keystream from block `ctr`, into out[at .. at + len) - checked by the caller */
+function stream_into(key, nonce, data, len, ctr, rounds, out, at) {
+    for (var i = 0, n; i < len; i += BLOCK) {
+        n = len - i; if (n > BLOCK) { n = BLOCK; }
         block_xor(key, ctr, nonce, 0, rounds, data, i, n, out, at);
         ctr = ctr + 1;
     }
@@ -442,7 +442,9 @@ function to_limbs(buf, out) {
 export function poly1305(key, msg) {
     if (key.length !== 32) { throw new Error('poly1305: key must be 32 bytes'); }
     var out = new Uint8Array(16);
-    poly1305_to(key, (msg instanceof Uint8Array) ? [msg] : msg, out, 0);
+    var parts = [];
+    (msg instanceof Uint8Array ? [msg] : msg).forEach(function (p) { parts.push(p, 0, p.length); });
+    poly1305_to(key, parts, out, 0);
     return out;
 }
 
@@ -458,7 +460,12 @@ var P_RB = new Uint8Array(17), P_BLK = new Uint8Array(17), P_STAGING = new Uint8
 var P_R = new Int32Array(10), P_R5 = new Int32Array(10), P_H = new Int32Array(10), P_C = new Int32Array(10), P_G = new Int32Array(10);
 var P_X = new Float64Array(10);
 
-/* The tag of the logical concatenation of `parts` under `key`, written to out[off .. off + 16). */
+/*
+ * The tag of the logical concatenation of `parts` under `key`, written to
+ * out[off .. off + 16). `parts` is flat, three entries a part - array, start,
+ * length - so a part inside a larger array (the ciphertext inside a sealed
+ * message) is read where it is, with no view made for it.
+ */
 function poly1305_to(key, parts, out, off) {
 
     /*
@@ -478,7 +485,7 @@ function poly1305_to(key, parts, out, off) {
      *   would give a different MAC for the same message split differently.
      */
     var total = 0;
-    for (var pi = 0; pi < parts.length; pi++) { total += parts[pi].length; }
+    for (var pi = 2; pi < parts.length; pi += 3) { total += parts[pi]; }
 
     var i, j, u;
 
@@ -548,21 +555,20 @@ function poly1305_to(key, parts, out, off) {
          *   as block-aligned would produce a different MAC for the same
          *   message split differently.
          */
-        var cur = parts[part_i];
-        while (cur !== undefined && part_off >= cur.length) {
-            part_i++; part_off = 0; cur = parts[part_i];
+        while (part_i < parts.length && part_off >= parts[part_i + 2]) {
+            part_i += 3; part_off = 0;
         }
         var src, src_off;
-        if (cur !== undefined && part_off + n <= cur.length) {
-            src = cur; src_off = part_off; part_off += n;
+        if (part_i < parts.length && part_off + n <= parts[part_i + 2]) {
+            src = parts[part_i]; src_off = parts[part_i + 1] + part_off; part_off += n;
         } else {
             /* n bytes from the logical concatenation, across the parts' ends, into staging */
             for (var got = 0; got < n && part_i < parts.length;) {
-                var p = parts[part_i], avail = p.length - part_off;
-                if (avail === 0) { part_i++; part_off = 0; continue; }
+                var p = parts[part_i], p_at = parts[part_i + 1] + part_off, avail = parts[part_i + 2] - part_off;
+                if (avail === 0) { part_i += 3; part_off = 0; continue; }
                 var take_n = n - got;
                 if (take_n > avail) { take_n = avail; }
-                for (var q = 0; q < take_n; q++) { staging[got + q] = p[part_off + q]; }
+                for (var q = 0; q < take_n; q++) { staging[got + q] = p[p_at + q]; }
                 got += take_n; part_off += take_n;
             }
             src = staging; src_off = 0;
@@ -831,21 +837,27 @@ var ZERO16 = new Uint8Array(16);
  *   each to a 16-byte boundary; dropping the pads gives a MAC over a
  *   different string and one that no other implementation produces.
  *
- * ⭐ AND NOTHING OF IT IS MADE PER CALL: the parts list, the pads and the
+ * ⭐ AND NOTHING OF IT IS MADE PER CALL: the parts list, the zero pad and the
  *   lengths block are the module's, as are the one-time key and the
  *   expected tag. Each is emptied or zeroed before the call returns - the
  *   list so that it keeps no caller's array alive, the rest because they
  *   held the one-time key or what it computed.
  */
-var EMPTY = new Uint8Array(0), PADS = [], MAC_PARTS = [], LENS = new Uint8Array(16), OTK = new Uint8Array(32), EXPECTED = new Uint8Array(16);
-for (var pad = 0; pad < 16; pad++) { PADS.push(ZERO16.subarray(0, pad)); }
+var EMPTY = new Uint8Array(0), LENS = new Uint8Array(16), OTK = new Uint8Array(32), EXPECTED = new Uint8Array(16);
+/*
+ * Always the same five parts - aad, its pad, ct, its pad, the lengths - with
+ * an empty one at length 0, which Poly1305 passes over. Only the entries
+ * change: emptying the list and pushing again would give it a new backing
+ * store on every call.
+ */
+var MAC_PARTS = [EMPTY, 0, 0, ZERO16, 0, 0, EMPTY, 0, 0, ZERO16, 0, 0, LENS, 0, 16];
 
 function put_le64(b, off, n) {
     for (var i = 0; i < 8; i++) { b[off + i] = n % 256; n = Math.floor(n / 256); }
 }
 
-/* the AEAD's tag over (aad, ct), with the one-time key of (key, nonce), written to out[off .. off + 16) */
-function aead_tag(key, nonce, n_off, ct, aad, out, off) {
+/* the AEAD's tag over (aad, ct[ct_at .. ct_at + ct_len)), with the one-time key of (key, nonce), written to out[off .. off + 16) */
+function aead_tag(key, nonce, n_off, ct, ct_at, ct_len, aad, out, off) {
     /* the one-time Poly1305 key: keystream block 0, which the ciphertext skips */
     block(key, 0, nonce, n_off);
     for (var i = 0; i < 32; i++) { OTK[i] = ks[i]; }
@@ -853,17 +865,14 @@ function aead_tag(key, nonce, n_off, ct, aad, out, off) {
 
     aad = aad || EMPTY;
     var parts = MAC_PARTS;
-    if (aad.length) { parts.push(aad); }
-    if (aad.length % 16) { parts.push(PADS[16 - aad.length % 16]); }
-    if (ct.length) { parts.push(ct); }
-    if (ct.length % 16) { parts.push(PADS[16 - ct.length % 16]); }
+    parts[0] = aad; parts[2] = aad.length; parts[5] = (16 - aad.length % 16) % 16;
+    parts[6] = ct; parts[7] = ct_at; parts[8] = ct_len; parts[11] = (16 - ct_len % 16) % 16;
     put_le64(LENS, 0, aad.length);
-    put_le64(LENS, 8, ct.length);
-    parts.push(LENS);
+    put_le64(LENS, 8, ct_len);
     try {
         poly1305_to(OTK, parts, out, off);
     } finally {
-        parts.length = 0;
+        parts[0] = parts[6] = EMPTY;
         OTK.fill(0);
     }
 }
@@ -872,8 +881,8 @@ function aead_tag(key, nonce, n_off, ct, aad, out, off) {
 function aead_seal_to(key, nonce, pt, aad, out, at) {
     if (key.length !== 32) { throw new Error('chacha20: key must be 32 bytes'); }
     if (1 + Math.ceil(pt.length / BLOCK) > 0x100000000) { throw new Error('chacha20: counter would exceed 2^32 - use a fresh nonce'); }
-    stream_into(key, nonce, pt, 1, 20, out, at);
-    aead_tag(key, nonce, 0, out.subarray(at, at + pt.length), aad, out, at + pt.length);
+    stream_into(key, nonce, pt, pt.length, 1, 20, out, at);
+    aead_tag(key, nonce, 0, out, at, pt.length, aad, out, at + pt.length);
     return pt.length + 16;
 }
 function aead_encrypt(key, nonce, pt, aad) {
@@ -884,15 +893,17 @@ function aead_encrypt(key, nonce, pt, aad) {
 /* the plaintext into out[at ..], or null - nothing written - when the tag does not verify */
 function aead_open_to(key, nonce, sealed, aad, out, at) {
     if (key.length !== 32) { throw new Error('chacha20: key must be 32 bytes'); }
-    var ct = sealed.subarray(0, sealed.length - 16);
-    if (aead_check(key, nonce, 0, ct, sealed.subarray(sealed.length - 16), aad) !== 1) { return null; }
-    stream_into(key, nonce, ct, 1, 20, out, at);
-    return ct.length;
+    var ct_len = sealed.length - 16;
+    if (aead_check(key, nonce, 0, sealed, aad) !== 1) { return null; }
+    stream_into(key, nonce, sealed, ct_len, 1, 20, out, at);
+    return ct_len;
 }
 
-function aead_check(key, nonce, n_off, ct, tag, aad) {
-    aead_tag(key, nonce, n_off, ct, aad, EXPECTED, 0);
-    var ok = equal(EXPECTED, tag);
+/* 1 when the last 16 bytes of `sealed` are the tag of the rest, 0 otherwise */
+function aead_check(key, nonce, n_off, sealed, aad) {
+    var ct_len = sealed.length - 16;
+    aead_tag(key, nonce, n_off, sealed, 0, ct_len, aad, EXPECTED, 0);
+    var ok = equal_at(EXPECTED, sealed, ct_len);
     EXPECTED.fill(0);
     return ok;
 }
@@ -953,11 +964,8 @@ export function xchacha20poly1305_decrypt(key, nonce, sealed, aad) {
 
     var x = xnonce(key, nonce);
 
-    var ct = sealed.subarray(0, sealed.length - 16);
-    var tag = sealed.subarray(sealed.length - 16);
-
-    var ok = aead_check(x.subkey, x.n12, 0, ct, tag, aad);
-    var out = (ok === 1) ? chacha20(x.subkey, x.n12, ct, 1) : null;
+    var ok = aead_check(x.subkey, x.n12, 0, sealed, aad);
+    var out = (ok === 1) ? chacha20(x.subkey, x.n12, sealed.subarray(0, sealed.length - 16), 1) : null;
     x.subkey.fill(0);
     return out;
 }
