@@ -36,8 +36,14 @@
  * @param {Uint8Array} b
  * @return {number} 1 or 0
  */
-export function equal(a, b) {
-    if (a.length !== b.length) { return 0; }
+export function equal(a, b) { return equal_at(a, b, 0); }
+
+/**
+ * equal(a, b.subarray(b_off)) without the view: a against the rest of b
+ * from b_off - a tag at the end of a sealed message, compared where it is.
+ */
+export function equal_at(a, b, b_off) {
+    if (a.length !== b.length - b_off) { return 0; }
     /*
      * Each difference folded to ONE BIT before it is accumulated.
      *
@@ -51,7 +57,7 @@ export function equal(a, b) {
      */
     var diff = 0;
     for (var i = 0; i < a.length; i++) {
-        var x = a[i] ^ b[i];
+        var x = a[i] ^ b[b_off + i];
         diff |= (x | -x) >>> 31;
     }
     return diff ^ 1;

@@ -121,6 +121,9 @@ function takes(n, form, args) {
 
 function long_enough(x, bytes) { return !!x && x.length >= bytes; }
 
+/* argument i of up to five, without an array */
+function nth(i, a, b, c, d, e) { return i === 0 ? a : i === 1 ? b : i === 2 ? c : i === 3 ? d : e; }
+
 /*
  * A later turn of the event loop. setImmediate where it exists (Node, Bun,
  * Deno); elsewhere a MessageChannel message, which browsers deliver without
@@ -173,29 +176,33 @@ function bytes(x) {
 function convert(who, args, text, only_bytes, fields, from) {
     var skip = from || 0;
     for (var i = 0; i < args.length - skip; i++) {
-        var x = args[skip + i];
-        if (typeof x === 'string' && only_bytes[i] !== undefined) {
-            throw new TypeError(who + ': ' + only_bytes[i] + ' must be a Uint8Array, not a string' +
-                ' (strings are taken as UTF-8 only for text such as a message or a password)');
-        }
-        /*
-         * ⚠ A NODE BUFFER BECOMES A PLAIN Uint8Array OVER THE SAME BYTES.
-         *   Buffer's slice() is a view, not a copy, so code that copies with
-         *   slice() and then changes the copy would change the caller's key
-         *   or message.
-         */
-        if (x instanceof Uint8Array && x.constructor !== Uint8Array) {
-            x = new Uint8Array(x.buffer, x.byteOffset, x.length);
-        }
-        if (text.indexOf(i) >= 0) { x = bytes(x); }
-        if (fields && fields[i] && x && typeof x === 'object' && !(x instanceof Uint8Array)) {
-            var copy = {};
-            for (var k in x) { copy[k] = fields[i].indexOf(k) >= 0 ? bytes(x[k]) : x[k]; }
-            x = copy;
-        }
-        args[skip + i] = x;
+        args[skip + i] = one(who, args[skip + i], i, text, only_bytes, fields);
     }
     return args;
+}
+
+/* one argument, at position i, as convert() describes - and as a context's method converts each of its own */
+function one(who, x, i, text, only_bytes, fields) {
+    if (typeof x === 'string' && only_bytes[i] !== undefined) {
+        throw new TypeError(who + ': ' + only_bytes[i] + ' must be a Uint8Array, not a string' +
+            ' (strings are taken as UTF-8 only for text such as a message or a password)');
+    }
+    /*
+     * ⚠ A NODE BUFFER BECOMES A PLAIN Uint8Array OVER THE SAME BYTES.
+     *   Buffer's slice() is a view, not a copy, so code that copies with
+     *   slice() and then changes the copy would change the caller's key
+     *   or message.
+     */
+    if (x instanceof Uint8Array && x.constructor !== Uint8Array) {
+        x = new Uint8Array(x.buffer, x.byteOffset, x.length);
+    }
+    if (text.indexOf(i) >= 0) { x = bytes(x); }
+    if (fields && fields[i] && x && typeof x === 'object' && !(x instanceof Uint8Array)) {
+        var copy = {};
+        for (var k in x) { copy[k] = fields[i].indexOf(k) >= 0 ? bytes(x[k]) : x[k]; }
+        x = copy;
+    }
+    return x;
 }
 
 /*
@@ -553,59 +560,61 @@ var context_kind = {};
  */
 function wrap_context(op, kind, inner, call_from, make_small, forget) {
     var small = null;
-    /* the context for a call whose method's arguments start at args[from] */
-    function pick_from(args, from) {
-        if (make_small && !long_enough(args[from + kind.message], call_from)) {
+    /* the context for a call whose message (kind.message) is `message` */
+    function choose(message) {
+        if (make_small && !long_enough(message, call_from)) {
             if (!small) { small = make_small(); }
             return small;
         }
         return inner;
     }
-    function pick(args) { return pick_from(args, 0); }
-    function run(name, args) {
-        var ctx = pick(args);
-        return ctx[name].apply(ctx, pure_args(args));
-    }
-    /*
-     * The _into form: the result written into out from `offset`, and its
-     * length returned (null when a decryption fails, and then nothing is
-     * written). An engine context with its own <name>_into writes there
-     * directly; any other result is computed whole, then set into out.
-     */
-    /* all: the call's own arguments, out and offset first */
-    function run_into(name, into_name, label, all) {
-        var out = all[0], offset = all[1], ctx = pick_from(all, 2);
-        pure_args(all);
-        if (typeof ctx[into_name] === 'function') {
-            /* every _into method takes out, offset and at most four more: called directly, no new array */
-            return ctx[into_name](out, offset, all[2], all[3], all[4], all[5]);
-        }
-        var result = ctx[name].apply(ctx, all.slice(2));
-        if (result === null) { return null; }
-        check_room(label, out, offset, result.length);
-        out.set(result, offset);
-        return result.length;
-    }
     /*
      * ⭐ EVERY CALL OF A CONTEXT PASSES HERE - a QUIC packet's encrypt, a
-     *   TLS record's - so it does no more than it must: the arguments
-     *   converted straight from `arguments` into one array, the labels
-     *   made once, nothing else allocated.
+     *   TLS record's - so the _sync forms allocate nothing of their own: the
+     *   arguments are parameters, converted one by one, never an array. A
+     *   rest parameter is a new array on every call (72 bytes for ECB's
+     *   three arguments, 88 for an AEAD's five). Every method takes at most
+     *   five arguments (an RSA signer's sign_pss), and the _into forms at most
+     *   four after out and offset; a missing one is passed as undefined,
+     *   which every method reads as left out.
      */
     function method(name, into) {
-        var text = kind.text[name], only_bytes = kind.bytes[name];
+        var text = kind.text[name], only_bytes = kind.bytes[name], m = kind.message;
         var label = op + '.' + name + (into ? '_into' : ''), sync_label = label + '_sync', into_name = name + '_into';
-        var skip = into ? 2 : 0;
+        function arg(x, i) { return pure_of(one(sync_label, x, i, text, only_bytes, null)); }
+        function call(a, b, c, d, e) {
+            var ctx = choose(nth(m, a, b, c, d, e));
+            return ctx[name](a, b, c, d, e);
+        }
+        /*
+         * The _into form: the result written into out from `offset`, and its
+         * length returned (null when a decryption fails, and then nothing is
+         * written). An engine context with its own <name>_into writes there
+         * directly; any other result is computed whole, then set into out.
+         */
+        function call_into(out, offset, a, b, c, d) {
+            var ctx = choose(nth(m, a, b, c, d));
+            if (typeof ctx[into_name] === 'function') { return ctx[into_name](out, offset, a, b, c, d); }
+            var result = ctx[name](a, b, c, d);
+            if (result === null) { return null; }
+            check_room(label, out, offset, result.length);
+            out.set(result, offset);
+            return result.length;
+        }
         function check_out(who, out, offset) {
             if (!(out instanceof Uint8Array) || !(offset >= 0 && offset % 1 === 0)) {
                 throw new TypeError(who + ': the output must be a Uint8Array and the offset a whole number >= 0');
             }
         }
-        function sync(...all) {
-            if (into) { check_out(sync_label, all[0], all[1]); }
-            convert(sync_label, all, text, only_bytes, null, skip);
-            return into ? run_into(name, into_name, label, all) : run(name, all);
-        }
+        var sync = into
+            ? function (out, offset, a, b, c, d) {
+                check_out(sync_label, out, offset);
+                return call_into(out, offset, arg(a, 0), arg(b, 1), arg(c, 2), arg(d, 3));
+            }
+            : function (a, b, c, d, e) {
+                return call(arg(a, 0), arg(b, 1), arg(c, 2), arg(d, 3), arg(e, 4));
+            };
+        /* the callback form makes a closure per call anyway; its arguments are converted before it returns */
         function async(...all) {
             var cb = all[all.length - 1];
             if (typeof cb !== 'function') {
@@ -613,10 +622,10 @@ function wrap_context(op, kind, inner, call_from, make_small, forget) {
             }
             all.pop();
             if (into) { check_out(label, all[0], all[1]); }
-            convert(label, all, text, only_bytes, null, skip);
+            pure_args(convert(label, all, text, only_bytes, null, into ? 2 : 0));
             later(function () {
                 var result;
-                try { result = into ? run_into(name, into_name, label, all) : run(name, all); } catch (e) { cb(e); return; }
+                try { result = (into ? call_into : call).apply(null, all); } catch (e) { cb(e); return; }
                 cb(null, result);
             });
         }

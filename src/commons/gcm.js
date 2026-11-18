@@ -23,7 +23,7 @@
  */
 
 import { rd_be32, wr_be32s, inc_be, check_room, overlaps_elsewhere } from './bytes.js';
-import { equal, wipe } from './ct.js';
+import { equal, equal_at, wipe } from './ct.js';
 
 var BLOCK = 16;
 
@@ -398,7 +398,7 @@ function gcm_open_to(block, iv, sealed, aad, h, table, out, off) {
     try {
         gcm_j0(h, iv, table);
         gcm_tag(block, h, table, sealed, 0, ct_len, aad, EXPECTED, 0);
-        if (equal(EXPECTED, sealed.subarray(ct_len)) !== 1) { return null; }
+        if (equal_at(EXPECTED, sealed, ct_len) !== 1) { return null; }
         gctr(block, J0, true, sealed, 0, ct_len, out, off);
         return ct_len;
     } finally {

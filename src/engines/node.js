@@ -432,7 +432,7 @@ ops.chacha20 = {
  *
  * Each size is the smallest at which native was faster in two runs of
  * bench/routing.js on Node 26.13 and two on Node 22, and stayed faster
- * above it (x86-64, AES-NI, one quiet core; the median of 9 batches of at
+ * above it (x86-64, AES-NI; the median of 9 pairs of batches of at
  * least 30 ms, so that each carries its share of the collector's work - a
  * native call's Cipher or Hmac is a native object the collector must
  * release, and the pure code's allocations are collected too). Where the
@@ -453,10 +453,15 @@ var NATIVE_FROM = {
     aes_gcm_encrypt: [2, 64], aes_gcm_decrypt: [2, 64],
     aes_ctr: [2, 96],
     chacha20: [2, 1024],
-    chacha20poly1305_encrypt: [2, 2048], chacha20poly1305_decrypt: [2, 512]
+    chacha20poly1305_encrypt: [2, 768], chacha20poly1305_decrypt: [2, 512]
 };
-/* the contexts' sizes from the _into calls, as well as encrypt: AES-GCM 128 to 256 by encrypt, 128 by encrypt_into */
-var NATIVE_CALL_FROM = { aes_gcm: 128, chacha20poly1305: 768, aes_ecb: 128 };
+/*
+ * One size for all four methods of a context, timed apart (encrypt and
+ * decrypt, and their _into forms): AES-GCM 192 by encrypt_into, decrypt
+ * and decrypt_into, 384 by encrypt; ChaCha20-Poly1305 768 by most;
+ * ECB 192 by encrypt_into and 96 to 128 by the rest.
+ */
+var NATIVE_CALL_FROM = { aes_gcm: 192, chacha20poly1305: 768, aes_ecb: 128 };
 for (var nf in NATIVE_FROM) {
     if (ops[nf]) { ops[nf].from = { arg: NATIVE_FROM[nf][0], bytes: NATIVE_FROM[nf][1] }; }
 }
